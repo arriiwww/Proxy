@@ -192,8 +192,8 @@ static void handle_client(void* arg) {
         log_debug("client fd=%d: proxy-style request, extracted host=%s uri=%s", cfd, host, uri);
     } else {
         // Обычный request: относительный URI
-        snprintf(uri, sizeof(uri), "%s", raw_uri);
-
+        strncpy(uri, raw_uri, sizeof(uri) - 1);
+        uri[sizeof(uri) - 1] = '\0';
 
         char* host_start = find_host_header(buf, used);
         if (!host_start) {
@@ -236,24 +236,68 @@ static void handle_client(void* arg) {
 
     log_info("client fd=%d: connected to origin %s:80, origin fd=%d", cfd, host, ofd);
 
-    char req[4096];
-    int req_len = snprintf(req, sizeof(req),
-                           "GET %s HTTP/1.0\r\n"
-                           "Host: %s\r\n"
-                           "Connection: close\r\n"
-                           "\r\n",
-                           uri, host);
-    if (req_len <= 0 || req_len >= (int)sizeof(req)) {
-        log_error("client fd=%d: failed to build HTTP/1.0 request", cfd);
+    // Находим конец request line
+    char* request_line_end = strstr(buf, "\r\n");
+    if (!request_line_end) {
+        log_error("client fd=%d: invalid request, no \\r\\n found", cfd);
         close(ofd);
         close(cfd);
         return;
     }
 
-    log_debug("client fd=%d: sending request to origin:\n%.*s", cfd, req_len, req);
+    // Создаём модифицированный request line с HTTP/1.0 и относительным URI
+    char new_request_line[4096];
+    int rl_len = snprintf(new_request_line, sizeof(new_request_line), "%s %s HTTP/1.0\r\n", method, uri);
+    if (rl_len <= 0 || rl_len >= (int)sizeof(new_request_line)) {
+        log_error("client fd=%d: failed to build request line", cfd);
+        close(ofd);
+        close(cfd);
+        return;
+    }
 
-    if (send_all(ofd, req, (size_t)req_len) < 0) {
-        log_error("client fd=%d: send_all to origin failed: %s", cfd, strerror(errno));
+    // Headers start после оригинального request line
+    char* headers_start = request_line_end + 2;
+    size_t headers_len = used - (headers_start - buf);
+
+    // Добавляем Connection: close, если нет
+    char connection_header[] = "Connection: close\r\n";
+    char* connection_pos = memmem_simple(headers_start, headers_len, "Connection:", strlen("Connection:"));
+    if (connection_pos) {
+        // Заменяем существующий Connection на close
+        char* conn_end = memchr(connection_pos, '\r', headers_len - (connection_pos - headers_start));
+        if (conn_end) {
+            // Перезаписываем значение
+            char* value_start = strchr(connection_pos, ':') + 1;
+            while (*value_start == ' ' || *value_start == '\t') value_start++;
+            memmove(value_start, " close", 6);  // Простая замена, предполагаем место хватает
+            // Удаляем остаток до \r
+            char* new_value_end = value_start + 6;
+            memmove(new_value_end, conn_end, headers_len - (conn_end - headers_start));
+            headers_len -= (conn_end - new_value_end);
+        }
+    } else {
+        // Добавляем перед \r\n\r\n
+        char* body_start = memmem_simple(headers_start, headers_len, "\r\n\r\n", 4);
+        if (body_start) {
+            memmove(body_start + strlen(connection_header), body_start, headers_len - (body_start - headers_start));
+            memcpy(body_start, connection_header, strlen(connection_header));
+            headers_len += strlen(connection_header);
+        }
+    }
+
+    // Логируем отправляемый запрос (для debug)
+    log_debug("client fd=%d: sending request to origin:\n%.*s%.*s", cfd, rl_len, new_request_line, (int)headers_len, headers_start);
+
+    // Отправляем модифицированный запрос: new_request_line + headers_start
+    if (send_all(ofd, new_request_line, (size_t)rl_len) < 0) {
+        log_error("client fd=%d: send request line to origin failed: %s", cfd, strerror(errno));
+        close(ofd);
+        close(cfd);
+        return;
+    }
+
+    if (send_all(ofd, headers_start, headers_len) < 0) {
+        log_error("client fd=%d: send headers to origin failed: %s", cfd, strerror(errno));
         close(ofd);
         close(cfd);
         return;
